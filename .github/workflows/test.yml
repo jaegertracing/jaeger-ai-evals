@@ -1,0 +1,52 @@
+# Copyright (c) 2026 The Jaeger Authors.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Unit Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+# See https://github.com/ossf/scorecard/blob/main/docs/checks.md#token-permissions
+permissions:
+  contents: read
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      # TODO: remove the `if` conditions below once the harness is in the repository; without
+      # them the job fails on a checkout that has no harness/tests directory.
+      - name: Unit tests
+        if: hashFiles('harness/tests/**') != ''
+        run: python3 -m unittest discover -s harness/tests
+
+      - name: Scenario readiness
+        if: hashFiles('harness/tests/**') != ''
+        run: |
+          for f in harness/scenarios/*.json; do
+            name=$(basename "$f" .json)
+            python3 harness/bench.py readiness "$name"
+          done
+
+      - name: Makefile parses
+        if: hashFiles('harness/tests/**') != ''
+        run: |
+          make -n setup smoke
+          make test

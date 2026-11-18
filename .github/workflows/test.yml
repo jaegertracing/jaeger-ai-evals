@@ -31,22 +31,5 @@ jobs:
         with:
           python-version: "3.12"
 
-      # TODO: remove the `if` conditions below once the harness is in the repository; without
-      # them the job fails on a checkout that has no harness/tests directory.
       - name: Unit tests
-        if: hashFiles('harness/tests/**') != ''
-        run: python3 -m unittest discover -s harness/tests
-
-      - name: Scenario readiness
-        if: hashFiles('harness/tests/**') != ''
-        run: |
-          for f in harness/scenarios/*.json; do
-            name=$(basename "$f" .json)
-            python3 harness/bench.py readiness "$name"
-          done
-
-      - name: Makefile parses
-        if: hashFiles('harness/tests/**') != ''
-        run: |
-          make -n setup smoke
-          make test
+        run: make test

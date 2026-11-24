@@ -1,0 +1,60 @@
+{
+ "flag": "emailMemoryLeak",
+ "version": 2,
+ "activation": {
+  "field": "defaultVariant",
+  "value": "10000x"
+ },
+ "deterministic": "bucketed",
+ "ground_truth": {
+  "service": "checkout",
+  "operation": "POST",
+  "mechanism": "Root-cause service is email (pass_rule.service_exact); ground_truth.service is checkout only because bench.py polls the signal with the Jaeger service filter on this value and the failing traces contain no email span (see notes). email/email_server.rb send_email (lines 61-97 at tag 3.0.0, notes/emailMemoryLeak-source-check-2026-10-01.md) pads the confirmation body with whitespace of length confirmation_content.length * (emailMemoryLeak - 1) on every request, so with the 1000x variant each request allocates far more memory. Under the 100 MiB container limit the process is cgroup OOM-killed and restarted (RestartCount 2 by 09:35:55Z, probes/emailMemoryLeak-2026-10-03-run2/final-inspect.log and oom-evidence.log). Requests in flight at the kill end on checkout's client span named POST (url.full http://email:6060/send_order_confirmation) with status ERROR and message EOF or read: connection reset by peer; the killed instance never exported an email server span for them, so those client spans have no matching email server span. The checkout PlaceOrder span stays status ok and frontend-proxy shows 504 UT after about 15 s (notes/emailMemoryLeak-live-capture-2026-10-03-run2.md, sections e and g). No span carries a memory, body-size or flag string (section h), so the memory cause is not reachable from trace data and is not required by mechanism_truth."
+ },
+ "expected_restarts": [
+  "email"
+ ],
+ "restart_before_run": [
+  "email"
+ ],
+ "mechanism_truth": "The service that receives the request crashed and restarted while it was handling requests, so calls already in flight to it ended with a dropped connection (end of stream or connection reset) instead of a reply. Saying why it crashed, such as running out of memory, is not required, and adding that guess is also correct. An answer that only says the receiving service returned errors, that the network between the caller and that service is faulty, or that the calling service is at fault, does not describe this mechanism.",
+ "signal_regex": "connection reset by peer|\"EOF\"",
+ "oracle": [
+  {
+   "tool": "search_traces",
+   "arguments": {
+    "service_name": "checkout",
+    "with_errors": true,
+    "start_time_min": "-15m"
+   }
+  },
+  {
+   "tool": "get_trace_errors",
+   "arguments": {
+    "trace_id": "$trace_id"
+   }
+  }
+ ],
+ "pass_rule": {
+  "service_exact": [
+   "email"
+  ],
+  "operation_exact": [
+   "POST /send_order_confirmation",
+   "POST"
+  ]
+ },
+ "cascade_rule": {
+  "required_any": [
+   [
+    "checkout|frontend-proxy|frontend"
+   ]
+  ]
+ },
+ "evidence": {
+  "ground_truth_trace": "evidence/emailMemoryLeak.trace.json",
+  "baseline_absence": "evidence/emailMemoryLeak.baseline.json"
+ },
+ "signal_wait_s": 600,
+ "notes": "The flag makes the email service's memory grow with every request until its container (100 MiB limit) is OOM-killed and restarts. Requests in flight at a kill fail on checkout's client span POST with EOF or read: connection reset by peer, and the killed instance exports no email server span for them. Memory is not in trace data, so the cause shows only as those dropped connections and email's restarts. ground_truth.service is checkout because the signal wait filters on that service and the failing traces hold no email span; the root cause in pass_rule stays email. expected_restarts [email] counts later kills inside trials as expected. signal_after_restart is omitted because the signal appears only after a kill. restart_before_run [email] makes the time to the first kill repeatable. Version 2 (2026-11-06) runs at 10000x: at 1000x email was killed only every 15 to 25 minutes, too rarely for the signal wait; at 10000x a probe saw 25 restarts in 10 minutes and an error on all 30 checkout traces in its window (28 EOF, 1 connection reset, 1 connection refused). Unverified: the time to a kill at other request rates, which span name an agent reports, and cascade_rule, which is a guess."
+}

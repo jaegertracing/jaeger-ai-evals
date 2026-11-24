@@ -1,1 +1,14 @@
+fixture.env
+stream.jsonl
+stderr.txt
+*.log
 __pycache__/
+runs/
+dist/
+.make.log
+harness/experiments/smoke-*.json
+!harness/experiments/smoke-paymentfailure.json
+harness/experiments/images/measure-*.json
+.fmt.log
+.cover/
+.coverage

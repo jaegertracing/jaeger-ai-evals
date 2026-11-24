@@ -31,5 +31,18 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install test tools
+        run: make install-test-tools
+
       - name: Unit tests
-        run: make test
+        run: make test-ci
+
+      - name: Scenario readiness
+        run: |
+          for f in harness/scenarios/*.json; do
+            name=$(basename "$f" .json)
+            python3 harness/bench.py readiness "$name"
+          done
+
+      - name: Makefile parses
+        run: make -n setup smoke

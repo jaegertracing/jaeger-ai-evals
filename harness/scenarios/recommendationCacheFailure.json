@@ -1,0 +1,68 @@
+{
+  "flag": "recommendationCacheFailure",
+  "version": 4,
+  "activation": {
+    "field": "defaultVariant",
+    "value": "on"
+  },
+  "deterministic": "bucketed",
+  "ground_truth": {
+    "service": "recommendation",
+    "operation": "get_product_list",
+    "mechanism": "recommendation/recommendation_server.py get_product_list (lines 66-98 at tag 3.0.0): with the flag on, each call is a cache miss with probability 0.5; a miss calls ProductCatalogService/ListProducts, appends the 10 catalog ids to the module-global cached_ids and then appends a quarter of the list to itself, so the list grows by about 1.25x per miss and is never deduplicated or trimmed. demo.product.count on the get_product_list span is len(cached_ids): 10 on every baseline span, 12 after the first miss, and 3,393,387 after 21 minutes live on 2026-09-27. Span duration follows the list size (baseline median about 5 ms; 143-159 ms at 2.7-3.4 million). No span sets ERROR status. frontend's RecommendationService/ListRecommendations client span and GET /api/recommendations slow down only once the count passes about 1 million; those are cascading symptoms. Under the benchmark's load the process reaches its 500M memory limit and is OOM-killed and restarted (observed 2026-09-28 about 5 to 6 min after the flip, at a count near 1 million; on 2026-09-27 at lighter load it reached 3.39 million in 21 min without a restart), so the steady state is a grow, OOM, restart cycle; while it restarts, frontend's ListRecommendations client spans fail with gRPC UNAVAILABLE / ECONNREFUSED."
+  },
+  "expected_restarts": ["recommendation"],
+  "restart_before_run": ["recommendation"],
+  "signal_after_restart": "recommendation",
+  "mechanism_truth": "An in-memory list that the service keeps between requests has items appended on every lookup miss and is never deduplicated or trimmed, so each request gets slower until the process runs out of memory and restarts, and then the list grows again. Connection errors while it restarts are a symptom of this, not the cause.",
+  "signal_regex": "demo\\.product\\.count\"(?:,\\s*\"type\":\\s*\"int64\",\\s*\"value\"|,\\s*\"value\":\\s*\\{\\s*\"intValue\")?:\\s*\"?\\d{7,}",
+  "oracle": [
+    {
+      "tool": "search_traces",
+      "arguments": {
+        "service_name": "recommendation",
+        "span_name": "get_product_list",
+        "start_time_min": "-5m",
+        "search_depth": 100
+      }
+    },
+    {
+      "tool": "get_trace_topology",
+      "arguments": {
+        "trace_id": "$trace_id",
+        "depth": 0
+      }
+    },
+    {
+      "tool": "get_span_details",
+      "arguments": {
+        "trace_id": "$trace_id",
+        "span_ids": [
+          "$span_id"
+        ]
+      }
+    }
+  ],
+  "pass_rule": {
+    "service_exact": [
+      "recommendation"
+    ],
+    "operation_exact": [
+      "get_product_list",
+      "oteldemo.RecommendationService/ListRecommendations"
+    ]
+  },
+  "cascade_rule": {
+    "required_any": [
+      [
+        "frontend"
+      ]
+    ]
+  },
+  "evidence": {
+    "ground_truth_trace": "evidence/recommendationCacheFailure.trace.json",
+    "baseline_absence": "evidence/recommendationCacheFailure.baseline.json"
+  },
+  "notes": "The flag turns on a cache in recommendation that grows on every miss (a miss with probability 0.5 per call), so demo.product.count on get_product_list spans climbs from 10, the only baseline value, past 1,000,000 in about 19 minutes (2026-09-27 capture). There is no error to find: recommendation returns no error traces, the signal is that span attribute, which only get_span_details shows, and the frontend slowdown the prompt describes is measurable only once the count passes about 1 million. signal_regex is magnitude, not presence (a count of 1,000,000 or more) and matches the MCP, v1 API and v3 API renderings. The cache lives in the process and is not cleared by restoring the flag; growth ends in an OOM restart, so expected_restarts and signal_after_restart (version 3) make a batch wait for the first restart and declare it expected, and restart_before_run restarts recommendation, then Jaeger, so the store never holds that restart. Version 4 (2026-11-05): the oracle passes search_depth 100 to reach the traces from before the restart. deterministic is bucketed: the direction is certain, the rate depends on load-generator traffic.",
+  "signal_wait_s": 1800
+}

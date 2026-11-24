@@ -1,0 +1,13 @@
+{
+  "name": "smoke-paymentfailure",
+  "version": 2,
+  "scenario": "paymentFailure",
+  "hypothesis": "A one-trial smoke test that the fixture, client and scoring work end to end, not a finding.",
+  "run": {"effort": "high", "max_turns": 30, "max_budget_usd": 2, "n_per_arm": 1, "seed": null},
+  "arms": {
+    "baseline": {"prompt": "neutral", "image": "quay.io/jaegertracing/jaeger:2.23.0", "tools": true}
+  },
+  "baseline_arm": null,
+  "thresholds": {},
+  "status": "CONFIRMED: smoke test, not a finding"
+}

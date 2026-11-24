@@ -1,0 +1,312 @@
+#!/usr/bin/env python3
+# Copyright (c) 2026 The Jaeger Authors.
+# SPDX-License-Identifier: Apache-2.0
+
+"""bench.py leak and readiness gates.
+
+Run with: python3 -m unittest discover harness/tests
+"""
+import json
+import os
+import pathlib
+import re
+import sys
+import tempfile
+import unittest
+import urllib.error
+from io import BytesIO
+from unittest import mock
+
+HARNESS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, HARNESS_DIR)
+import bench  # noqa: E402
+
+
+def gate(fn, *args, **kw):
+    out = []
+    return fn(*args, out=out.append, **kw), out
+
+
+class TestLeak(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = self._tmp.name
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def write(self, text):
+        p = os.path.join(self.tmp, "p%d.txt" % len(os.listdir(self.tmp)))
+        with open(p, "w") as f:
+            f.write(text)
+        return p
+
+    def test_shipped_prompts_pass(self):
+        files = [os.path.join(HARNESS_DIR, "system-prompt.txt"), os.path.join(HARNESS_DIR, "prompts", "neutral.txt")]
+        rc, out = gate(bench.leak, files)
+        self.assertEqual(rc, 0, out)
+
+    def test_naming_the_system_under_test_fails(self):
+        # The early batches' noskill prompt, which names the demo: the gate refuses it.
+        rc, out = gate(bench.leak, [os.path.join(HARNESS_DIR, "tests", "data", "prompt-naming-the-demo.txt")])
+        self.assertEqual(rc, 1)
+        self.assertIn("OpenTelemetry Demo", out[0])
+        for text in ("the otel demo", "an Astronomy Shop", "OPENTELEMETRY-DEMO checkout"):
+            self.assertEqual(gate(bench.leak, [self.write(text)])[0], 1, text)
+
+    def test_leak_word_fails_with_file_line_word(self):
+        p = self.write("fine line\nthe Feature Flag is on\n")
+        rc, out = gate(bench.leak, [p])
+        self.assertEqual(rc, 1)
+        self.assertIn("%s:2:feature flag" % p, out)
+
+    def test_word_boundary(self):
+        # "flags" and "scenarios" are not the words "flag" and "scenario".
+        rc, out = gate(bench.leak, [self.write("many flags, two scenarios\n")])
+        self.assertEqual(rc, 0, out)
+
+    def test_missing_file_is_2(self):
+        rc, _ = gate(bench.leak, [os.path.join(self.tmp, "nope.txt")])
+        self.assertEqual(rc, 2)
+
+
+class TestReadiness(unittest.TestCase):
+    def test_scenario_keys_are_plain(self):
+        # a dated note typed into a key name once made signal_wait_s fall back to its default
+        for f in sorted(pathlib.Path(HARNESS_DIR, "scenarios").glob("*.json")):
+            for k in json.loads(f.read_text()):
+                self.assertRegex(k, r"^[a-z][a-z0-9_]*$", f.name)
+
+    def test_shipped_scenarios_pass(self):
+        for s in ("paymentFailure", "adFailure", "paymentUnreachable"):
+            rc, out = gate(bench.readiness, s)
+            self.assertEqual(rc, 0, out)
+            self.assertEqual(out[-1], "readiness %s: PASS" % s)
+
+    def test_missing_scenario_fails(self):
+        rc, out = gate(bench.readiness, "noSuchScenario")
+        self.assertEqual(rc, 1)
+        self.assertIn("scenario file not found", out[0])
+
+    def test_missing_evidence_fails(self):
+        with open(os.path.join(HARNESS_DIR, "scenarios", "paymentFailure.json")) as f:
+            d = json.load(f)
+        d["evidence"]["baseline_absence"] = "../nowhere.json"
+        with tempfile.TemporaryDirectory() as h:
+            os.makedirs(os.path.join(h, "scenarios"))
+            with open(os.path.join(h, "scenarios", "x.json"), "w") as f:
+                json.dump(d, f)
+            rc, out = gate(bench.readiness, "x", harness=h)
+        self.assertEqual(rc, 1)
+        self.assertIn("readiness x: baseline_absence file exists - FAIL", "\n".join(out))
+        self.assertEqual(out[-1], "readiness x: FAIL")
+
+    def test_version_must_be_a_positive_integer(self):
+        with open(os.path.join(HARNESS_DIR, "scenarios", "paymentFailure.json")) as f:
+            d = json.load(f)
+        d["evidence"] = {k: os.path.join(HARNESS_DIR, "scenarios", v) for k, v in d["evidence"].items()}
+        for bad in (None, 0, -1, "1", 1.5, True):
+            with self.subTest(version=bad), tempfile.TemporaryDirectory() as h:
+                os.makedirs(os.path.join(h, "scenarios"))
+                doc = dict(d)
+                if bad is None:
+                    del doc["version"]
+                else:
+                    doc["version"] = bad
+                with open(os.path.join(h, "scenarios", "x.json"), "w") as f:
+                    json.dump(doc, f)
+                rc, out = gate(bench.readiness, "x", harness=h)
+                self.assertEqual(rc, 1, out)
+                self.assertIn("readiness x: version is a positive integer - FAIL", "\n".join(out))
+
+    def test_oracle_must_be_a_non_empty_list_of_tool_and_arguments(self):
+        with open(os.path.join(HARNESS_DIR, "scenarios", "paymentFailure.json")) as f:
+            d = json.load(f)
+        d["evidence"] = {k: os.path.join(HARNESS_DIR, "scenarios", v) for k, v in d["evidence"].items()}
+        cases = {"missing": None, "empty list": [], "item without tool": [{"arguments": {}}]}
+        for label, bad in cases.items():
+            with self.subTest(oracle=label), tempfile.TemporaryDirectory() as h:
+                os.makedirs(os.path.join(h, "scenarios"))
+                doc = dict(d)
+                if bad is None:
+                    del doc["oracle"]
+                else:
+                    doc["oracle"] = bad
+                with open(os.path.join(h, "scenarios", "x.json"), "w") as f:
+                    json.dump(doc, f)
+                rc, out = gate(bench.readiness, "x", harness=h)
+                self.assertEqual(rc, 1, out)
+                self.assertIn("readiness x: oracle is a non-empty list of {tool, arguments} - FAIL", "\n".join(out))
+
+
+class TestOracleSpanId(unittest.TestCase):
+    def test_span_id_expands_per_trace_from_earlier_output(self):
+        from unittest import mock
+        outputs = {"search_traces": '{"traces":[{"trace_id":"aa"},{"trace_id":"bb"}]}',
+                   "get_trace_topology": lambda a: '{"spans":[{"path":"%s01/%s02"}]}' % ((a["trace_id"] * 7,) * 2)}
+        seen = []
+
+        class Client:
+            def __init__(self, *a, **k):
+                pass
+
+            def initialize(self):
+                pass
+
+            def list_tools(self):
+                return [{"name": n} for n in ("search_traces", "get_trace_topology", "get_span_details")]
+
+            def call_tool(self, name, args):
+                seen.append((name, args))
+                o = outputs.get(name)
+                text = o(args) if callable(o) else o or ('{"n":%d}' % (99 if args["span_ids"] == ["bbbbbbbbbbbbbb02"] else 1))
+                return {"is_error": False, "raw": {}, "text": text}
+
+        with tempfile.TemporaryDirectory() as h:
+            os.makedirs(os.path.join(h, "scenarios"))
+            with open(os.path.join(h, "scenarios", "x.json"), "w") as f:
+                json.dump({"signal_regex": '"n":99', "oracle": [
+                    {"tool": "search_traces", "arguments": {}},
+                    {"tool": "get_trace_topology", "arguments": {"trace_id": "$trace_id"}},
+                    {"tool": "get_span_details", "arguments": {"trace_id": "$trace_id", "span_ids": ["$span_id"]}}]}, f)
+            with mock.patch.object(bench, "HARNESS", h), mock.patch.object(bench, "MCPClient", Client), \
+                    mock.patch.object(bench.config, "mcp_url", lambda cfg: "u"):
+                rc, out = gate(bench.oracle, "x", {})
+        self.assertEqual(rc, 0, out)
+        self.assertEqual([a for n, a in seen if n == "get_span_details"], [
+            {"trace_id": "aa", "span_ids": ["aaaaaaaaaaaaaa01"]}, {"trace_id": "aa", "span_ids": ["aaaaaaaaaaaaaa02"]},
+            {"trace_id": "bb", "span_ids": ["bbbbbbbbbbbbbb01"]}, {"trace_id": "bb", "span_ids": ["bbbbbbbbbbbbbb02"]}])
+
+
+# Schemas as served (runs/*/batch-*/tools.json): 2.20.0 requires service_name; main 5319091a has the
+# structured inputs and sql; main 89279ae26 (jaeger#10083) has sql only.
+S2200 = {"properties": {"service_name": {}, "with_errors": {}}, "required": ["service_name"]}
+S5319 = {"properties": {"service_name": {}, "with_errors": {}, "sql": {}}}
+SQL_ONLY = {"properties": {"sql": {}}}
+
+
+def run_oracle(served, oracle_calls, scenario_doc=None):
+    from unittest import mock
+    seen = []
+
+    class Client:
+        def __init__(self, *a, **k):
+            pass
+
+        def initialize(self):
+            pass
+
+        def list_tools(self):
+            return [{"name": n, "inputSchema": sc} for n, sc in served.items()]
+
+        def call_tool(self, name, args):
+            seen.append((name, args))
+            return {"is_error": False, "raw": {}, "text": "sig"}
+
+    with tempfile.TemporaryDirectory() as h:
+        os.makedirs(os.path.join(h, "scenarios"))
+        with open(os.path.join(h, "scenarios", "x.json"), "w") as f:
+            json.dump({"signal_regex": "sig", "oracle": oracle_calls}, f)
+        with mock.patch.object(bench, "HARNESS", h), mock.patch.object(bench, "MCPClient", Client), \
+                mock.patch.object(bench.config, "mcp_url", lambda cfg: "u"):
+            rc, out = gate(bench.oracle, "x", {})
+    return rc, out, seen
+
+
+def scenario_search(name):
+    with open(os.path.join(os.path.dirname(bench.__file__), "scenarios", name + ".json")) as f:
+        return json.load(f)["oracle"][0]
+
+
+class TestOracleSearchTool(unittest.TestCase):
+    def test_2200_schema_passes_through_to_search_traces(self):
+        call = {"tool": "search_traces", "arguments": {"service_name": "cart", "with_errors": True}}
+        rc, out, seen = run_oracle({"search_traces": S2200}, [call])
+        self.assertEqual((rc, seen), (0, [("search_traces", call["arguments"])]), out)
+
+    def test_5319091a_schema_passes_through_to_find_traces(self):
+        call = {"tool": "search_traces", "arguments": {"service_name": "cart", "with_errors": True}}
+        rc, out, seen = run_oracle({"find_traces": S5319}, [call])
+        self.assertEqual((rc, seen), (0, [("find_traces", call["arguments"])]), out)
+
+    def test_sql_only_schema_sends_one_statement(self):
+        cases = {
+            "cartFailure": "SELECT DISTINCT trace_id FROM spans WHERE between(start_time, now() - '15m', now()) "
+                           "AND service = 'cart' AND status = 'error' LIMIT 10",
+            "recommendationCacheFailure": "SELECT DISTINCT trace_id FROM spans WHERE between(start_time, now() - '5m', now()) "
+                                          "AND service = 'recommendation' AND name = 'get_product_list' LIMIT 100",
+        }
+        for name, want in cases.items():
+            with self.subTest(scenario=name):
+                rc, out, seen = run_oracle({"find_traces": SQL_ONLY}, [scenario_search(name)])
+                self.assertEqual((rc, seen), (0, [("find_traces", {"sql": want})]), out)
+                self.assertIn(want, "\n".join(out))  # the PASS line carries the statement
+
+    def test_unsupported_argument_fails_without_a_call(self):
+        call = {"tool": "search_traces", "arguments": {"service_name": "cart", "attributes": {"a": "b"}}}
+        rc, out, seen = run_oracle({"find_traces": SQL_ONLY}, [call])
+        self.assertEqual((rc, seen), (1, []))
+        self.assertIn("oracle x: FAIL - cannot compile attributes", "\n".join(out))
+
+
+class TestToStatement(unittest.TestCase):
+    HEAD = "SELECT DISTINCT trace_id FROM spans WHERE between(start_time, now() - '%s', now())"
+
+    def test_defaults(self):
+        self.assertEqual(bench.to_statement({}), self.HEAD % "1h" + " LIMIT 10")
+
+    def test_every_supported_key(self):
+        args = {"service_name": "a", "span_name": "b", "with_errors": True, "start_time_min": "-1h30m", "search_depth": 5}
+        self.assertEqual(bench.to_statement(args), self.HEAD % "1h30m" + " AND service = 'a' AND name = 'b' AND status = 'error' LIMIT 5")
+        self.assertNotIn("status", bench.to_statement({"with_errors": False}))
+
+    def test_refusals(self):
+        for args in ({"attributes": {}}, {"duration_min": "1s"}, {"start_time_max": "now"},
+                     {"start_time_min": "2026-11-01T00:00:00Z"}, {"service_name": "o'brien"},
+                     {"span_name": "x'--"}, {"search_depth": 0}, {"search_depth": "10"}):
+            with self.subTest(args=args), self.assertRaises(ValueError):
+                bench.to_statement(args)
+
+    def test_statement_shape_is_one_jaeger_accepts(self):
+        # internal/sqlquery/compile_test.go "window only" accepts exactly this head, unaliased
+        self.assertTrue(bench.to_statement({}).startswith(
+            "SELECT DISTINCT trace_id FROM spans WHERE between(start_time, now() - '1h', now())"))
+
+def span(trace_id, name, attrs=()):
+    return {"traceId": trace_id, "name": name, "status": {},
+            "attributes": [{"key": k, "value": v} for k, v in attrs]}
+
+
+def resource(service, *spans):
+    return {"resource": {"attributes": [{"key": "service.name", "value": {"stringValue": service}}]},
+            "scopeSpans": [{"spans": list(spans)}]}
+
+
+class TestTracesV3(unittest.TestCase):
+    CFG = {"FIXTURE_HOST": "h", "JAEGER_UI_PORT": "1", "JAEGER_BASE_PATH": "/j"}
+
+    def test_groups_spans_by_trace_id(self):
+        body = {"result": {"resourceSpans": [resource("checkout", span("a", "x"), span("b", "y")),
+                                              resource("payment", span("a", "z"))]}}
+        with mock.patch.object(bench, "http_json", return_value=body) as hj:
+            got = bench.traces(self.CFG, "checkout", 1_000_000, 2_000_000, 5, 10)
+        self.assertEqual([(t["traceID"], [(s["name"], s["serviceName"]) for s in t["spans"]]) for t in got],
+                         [("a", [("x", "checkout"), ("z", "payment")]), ("b", [("y", "checkout")])])
+        url = hj.call_args[0][0]
+        self.assertIn("/j/api/v3/traces?query.serviceName=checkout", url)
+        self.assertIn("query.searchDepth=5", url)
+
+    def test_no_traces_is_404_and_empty(self):
+        err = urllib.error.HTTPError("u", 404, "Not Found", {}, BytesIO(b'{"error":{"message":"No traces found"}}'))
+        with mock.patch.object(bench, "http_json", side_effect=err):
+            self.assertEqual(bench.traces(self.CFG, "checkout", 1_000_000, 2_000_000, 5, 10), [])
+
+    def test_cache_count_signal_matches_v3_attribute(self):
+        sig = re.compile(json.loads(pathlib.Path(HARNESS_DIR, "scenarios", "recommendationCacheFailure.json").read_text())["signal_regex"], re.I)
+        dump = lambda n: json.dumps(span("a", "x", [("demo.product.count", {"intValue": n})]))
+        self.assertTrue(sig.search(dump("1234567")))
+        self.assertFalse(sig.search(dump("123456")))
+
+
+if __name__ == "__main__":
+    unittest.main()
